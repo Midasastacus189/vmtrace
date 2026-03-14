@@ -1,4 +1,4 @@
-#include "whp_lazy_emulator/whp_lazy_emulator.hpp"
+#include "vmtrace/vmtrace.hpp"
 
 #include <WinHvPlatform.h>
 
@@ -11,11 +11,15 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace whp_lazy_emulator
+namespace vmtrace
 {
     namespace
     {
         constexpr UINT32 vp_index = 0;
+        constexpr std::uint64_t page_table_entry_present = 1ull << 0;
+        constexpr std::uint64_t page_table_entry_writable = 1ull << 1;
+        constexpr std::uint64_t page_table_entry_address_mask = 0x000FFFFFFFFFF000ull;
+        constexpr std::uint64_t internal_page_table_base = 0x0000007000000000ull;
 
         struct mapped_page
         {
@@ -38,7 +42,8 @@ namespace whp_lazy_emulator
         [[noreturn]] void throw_hr(HRESULT hr, const char* action)
         {
             std::ostringstream stream;
-            stream << action << " failed with HRESULT 0x" << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(hr);
+            stream << action << " failed with HRESULT 0x" << std::hex << std::setw(8) << std::setfill('0')
+                   << static_cast<std::uint32_t>(hr);
             throw std::runtime_error(stream.str());
         }
 
@@ -159,7 +164,8 @@ namespace whp_lazy_emulator
             segment.NonSystemSegment = 1;
             segment.DescriptorPrivilegeLevel = 0;
             segment.Present = 1;
-            segment.Default = 1;
+            segment.Long = 1;
+            segment.Default = 0;
             segment.Granularity = 1;
             return segment;
         }
@@ -174,7 +180,7 @@ namespace whp_lazy_emulator
             segment.NonSystemSegment = 1;
             segment.DescriptorPrivilegeLevel = 0;
             segment.Present = 1;
-            segment.Default = 1;
+            segment.Default = 0;
             segment.Granularity = 1;
             return segment;
         }
@@ -201,15 +207,16 @@ namespace whp_lazy_emulator
             ensure_platform_support();
             configure_partition();
             virtual_processor_ = std::make_unique<virtual_processor_handle>(partition_.get());
+            initialize_long_mode_page_tables();
         }
 
         void set_cpu_state(const cpu_state& state)
         {
-            const std::array<WHV_REGISTER_NAME, 19> names = {
-                WHvX64RegisterRip, WHvX64RegisterRsp, WHvX64RegisterRflags, WHvX64RegisterRax,  WHvX64RegisterRbx,
-                WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRsi,    WHvX64RegisterRdi,  WHvX64RegisterRbp,
-                WHvX64RegisterCs,  WHvX64RegisterDs,  WHvX64RegisterEs,     WHvX64RegisterFs,   WHvX64RegisterGs,
-                WHvX64RegisterSs,  WHvX64RegisterCr0, WHvX64RegisterCr4,    WHvX64RegisterEfer,
+            const std::array<WHV_REGISTER_NAME, 22> names = {
+                WHvX64RegisterRip, WHvX64RegisterRsp,  WHvX64RegisterRflags, WHvX64RegisterRax,    WHvX64RegisterRbx, WHvX64RegisterRcx,
+                WHvX64RegisterRdx, WHvX64RegisterRsi,  WHvX64RegisterRdi,    WHvX64RegisterRbp,    WHvX64RegisterCs,  WHvX64RegisterDs,
+                WHvX64RegisterEs,  WHvX64RegisterFs,   WHvX64RegisterGs,     WHvX64RegisterSs,     WHvX64RegisterCr0, WHvX64RegisterCr4,
+                WHvX64RegisterCr3, WHvX64RegisterEfer, WHvX64RegisterLstar,  WHvX64RegisterSfmask,
             };
 
             std::array<WHV_REGISTER_VALUE, names.size()> values = {};
@@ -233,9 +240,12 @@ namespace whp_lazy_emulator
             values[13].Segment = data_segment;
             values[14].Segment = data_segment;
             values[15].Segment = data_segment;
-            values[16].Reg64 = 0x1;
-            values[17].Reg64 = 0x0;
-            values[18].Reg64 = 0x0;
+            values[16].Reg64 = 0x80000001ull;
+            values[17].Reg64 = 0x20ull;
+            values[18].Reg64 = pml4_gpa_;
+            values[19].Reg64 = (1ull << 8) | (1ull << 10) | (callbacks_.syscall ? 1ull : 0ull);
+            values[20].Reg64 = callbacks_.syscall_intercept_address.value_or(0);
+            values[21].Reg64 = 0;
 
             check_hr(
                 WHvSetVirtualProcessorRegisters(partition_.get(), vp_index, names.data(), static_cast<UINT32>(names.size()), values.data()),
@@ -312,7 +322,15 @@ namespace whp_lazy_emulator
                     running = false;
                     break;
                 case WHvRunVpExitReasonX64Halt:
-                    running = false;
+                    if (callbacks_.syscall && callbacks_.syscall_intercept_address.has_value() &&
+                        align_down_to_page(exit_context.VpContext.Rip) == align_down_to_page(callbacks_.syscall_intercept_address.value()))
+                    {
+                        handle_syscall(running);
+                    }
+                    else
+                    {
+                        running = false;
+                    }
                     break;
                 default: {
                     std::ostringstream stream;
@@ -390,14 +408,6 @@ namespace whp_lazy_emulator
 
         void handle_memory_access(const WHV_MEMORY_ACCESS_CONTEXT& memory_access, bool& running)
         {
-            if (callbacks_.syscall && callbacks_.syscall_intercept_address.has_value() &&
-                memory_access.AccessInfo.AccessType == WHvMemoryAccessExecute && memory_access.AccessInfo.GvaValid &&
-                memory_access.Gva == callbacks_.syscall_intercept_address.value())
-            {
-                handle_syscall(running);
-                return;
-            }
-
             if (!callbacks_.memory_trap)
             {
                 throw std::runtime_error("No memory trap handler is configured.");
@@ -492,7 +502,7 @@ namespace whp_lazy_emulator
                 }
                 else
                 {
-                    auto raw_page =
+                    auto* raw_page =
                         static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
                     if (raw_page == nullptr)
                     {
@@ -521,6 +531,75 @@ namespace whp_lazy_emulator
             check_hr(WHvMapGpaRange(partition_.get(), page->host_page, page_base, page_size,
                                     static_cast<WHV_MAP_GPA_RANGE_FLAGS>(page->map_flags)),
                      "WHvMapGpaRange");
+
+            ensure_virtual_mapping(page_base);
+        }
+
+        void initialize_long_mode_page_tables()
+        {
+            pml4_gpa_ = allocate_internal_page();
+        }
+
+        std::uint64_t allocate_internal_page()
+        {
+            auto* raw_page = static_cast<std::uint8_t*>(::VirtualAlloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (raw_page == nullptr)
+            {
+                throw std::runtime_error("VirtualAlloc failed while creating an internal page.");
+            }
+
+            std::memset(raw_page, 0, page_size);
+
+            const std::uint64_t page_gpa = next_internal_gpa_;
+            next_internal_gpa_ += page_size;
+
+            auto page = std::make_unique<mapped_page>();
+            page->owned_page.reset(raw_page);
+            page->host_page = raw_page;
+            page->map_flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite;
+
+            check_hr(WHvMapGpaRange(partition_.get(), page->host_page, page_gpa, page_size,
+                                    static_cast<WHV_MAP_GPA_RANGE_FLAGS>(page->map_flags)),
+                     "WHvMapGpaRange");
+
+            page_table_views_[page_gpa] = reinterpret_cast<std::uint64_t*>(raw_page);
+            mapped_pages_[page_gpa] = std::move(page);
+            return page_gpa;
+        }
+
+        std::uint64_t* get_page_table_entries(std::uint64_t page_gpa)
+        {
+            return page_table_views_.at(page_gpa);
+        }
+
+        std::uint64_t ensure_child_table(std::uint64_t table_gpa, std::size_t index)
+        {
+            auto* const table_entries = get_page_table_entries(table_gpa);
+            auto& entry = table_entries[index];
+            if ((entry & page_table_entry_present) == 0)
+            {
+                const std::uint64_t child_gpa = allocate_internal_page();
+                entry = child_gpa | page_table_entry_present | page_table_entry_writable;
+                return child_gpa;
+            }
+
+            return entry & page_table_entry_address_mask;
+        }
+
+        void ensure_virtual_mapping(std::uint64_t guest_address)
+        {
+            const std::uint64_t page_base = align_down_to_page(guest_address);
+            const auto pml4_index = static_cast<std::size_t>((page_base >> 39) & 0x1FF);
+            const auto pdpt_index = static_cast<std::size_t>((page_base >> 30) & 0x1FF);
+            const auto pd_index = static_cast<std::size_t>((page_base >> 21) & 0x1FF);
+            const auto pt_index = static_cast<std::size_t>((page_base >> 12) & 0x1FF);
+
+            const std::uint64_t pdpt_gpa = ensure_child_table(pml4_gpa_, pml4_index);
+            const std::uint64_t pd_gpa = ensure_child_table(pdpt_gpa, pdpt_index);
+            const std::uint64_t pt_gpa = ensure_child_table(pd_gpa, pd_index);
+
+            auto* const pt_entries = get_page_table_entries(pt_gpa);
+            pt_entries[pt_index] = page_base | page_table_entry_present | page_table_entry_writable;
         }
 
         void handle_exception(const WHV_RUN_VP_EXIT_CONTEXT& exit_context)
@@ -624,6 +703,9 @@ namespace whp_lazy_emulator
         emulator_callbacks callbacks_;
         WHV_EXTENDED_VM_EXITS supported_exits_ = {};
         std::unordered_map<std::uint64_t, std::unique_ptr<mapped_page>> mapped_pages_;
+        std::unordered_map<std::uint64_t, std::uint64_t*> page_table_views_;
+        std::uint64_t pml4_gpa_ = 0;
+        std::uint64_t next_internal_gpa_ = internal_page_table_base;
     };
 
     emulator::emulator(emulator_callbacks callbacks)
@@ -692,4 +774,4 @@ namespace whp_lazy_emulator
         stream << "0x" << std::hex << value;
         return stream.str();
     }
-} // namespace whp_lazy_emulator
+} // namespace vmtrace

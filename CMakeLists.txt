@@ -1,39 +1,93 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(whp_lazy_emulator LANGUAGES CXX)
+project(vmtrace VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_library(whp_lazy_emulator_lib STATIC
-    src/whp_lazy_emulator.cpp
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+set(ASMJIT_EMBED ON CACHE BOOL "" FORCE)
+set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(third_party/asmjit)
+
+add_library(vmtrace STATIC
+    src/lib/vmtrace.cpp
 )
 
-target_compile_features(whp_lazy_emulator_lib PRIVATE cxx_std_20)
+add_library(vmtrace::vmtrace ALIAS vmtrace)
 
-target_compile_definitions(whp_lazy_emulator_lib PRIVATE
+target_compile_features(vmtrace PUBLIC cxx_std_20)
+
+target_compile_definitions(vmtrace PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
 )
 
-target_include_directories(whp_lazy_emulator_lib PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+target_include_directories(vmtrace
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(whp_lazy_emulator_lib PUBLIC
+target_link_libraries(vmtrace PUBLIC
     WinHvPlatform
 )
 
-add_executable(whp_lazy_emulator
-    src/main.cpp
+add_executable(vmtrace_demo
+    src/examples/demo_main.cpp
 )
 
-target_compile_features(whp_lazy_emulator PRIVATE cxx_std_20)
+target_compile_features(vmtrace_demo PRIVATE cxx_std_20)
 
-target_compile_definitions(whp_lazy_emulator PRIVATE
+target_compile_definitions(vmtrace_demo PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
 )
 
-target_link_libraries(whp_lazy_emulator PRIVATE
-    whp_lazy_emulator_lib
+target_link_libraries(vmtrace_demo PRIVATE
+    vmtrace
+    asmjit::asmjit
+)
+
+set(vmtrace_install_cmakedir "${CMAKE_INSTALL_LIBDIR}/cmake/vmtrace")
+
+install(
+    TARGETS vmtrace vmtrace_demo
+    EXPORT vmtrace_targets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/vmtrace/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vmtrace
+)
+
+install(
+    EXPORT vmtrace_targets
+    NAMESPACE vmtrace::
+    FILE vmtraceTargets.cmake
+    DESTINATION ${vmtrace_install_cmakedir}
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/vmtraceConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vmtraceConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/vmtraceConfig.cmake"
+    INSTALL_DESTINATION ${vmtrace_install_cmakedir}
+)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/vmtraceConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/vmtraceConfigVersion.cmake"
+    DESTINATION ${vmtrace_install_cmakedir}
 )
