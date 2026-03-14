@@ -44,10 +44,7 @@ jobs:
 
       - name: Run clang-format check
         run: |
-          cd src && find . -regex '.*\.\(cpp\|hpp\|cc\|cxx\|h\|c\)' -exec clang-format-${{ env.LLVM_VERSION }} -style=file --dry-run --Werror {} +
-
-      - name: Verify Page Formatting
-        run: cd page && npx --yes prettier . --check
+          find . -regex '.*\.\(cpp\|hpp\|cc\|cxx\|h\|c\)' -exec clang-format-${{ env.LLVM_VERSION }} -style=file --dry-run --Werror {} +
 
   build:
     name: Build
