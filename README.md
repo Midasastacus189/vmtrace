@@ -1,35 +1,42 @@
 # vmtrace
 
-`vmtrace` is a small Windows Hypervisor Platform library for running a virtual CPU from a supplied CPU state and reacting to traps as they occur.
+[![Build](https://img.shields.io/github/actions/workflow/status/momo5502/vmtrace/build.yml?branch=main&label=build)](https://github.com/momo5502/vmtrace/actions/workflows/build.yml)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D6)](https://github.com/momo5502/vmtrace)
+[![C%2B%2B](https://img.shields.io/badge/C%2B%2B-20-00599C)](https://github.com/momo5502/vmtrace)
+[![CMake](https://img.shields.io/badge/cmake-3.20%2B-064F8C)](https://github.com/momo5502/vmtrace)
 
-The core library is built as a static library, and the repository also includes a tiny `vmtrace_demo` executable that shows lazy page mapping in action.
+`vmtrace` is a small Windows Hypervisor Platform library for trap-driven guest execution. It lets you start from a supplied CPU state, map guest memory from host pages, and react to memory, `CPUID`, and syscall-related exits in user mode.
 
-## What it does
+## Features
 
-- Accepts an initial x64 CPU state
-- Starts execution from the supplied `RIP`
-- Traps page-level memory read, write, and execute faults
-- Lets the host decide whether to map memory, deny access, or stop emulation
-- Supports host-backed guest memory mappings
-- Exposes optional `CPUID` and syscall interception hooks
+- Static C++ library with a small public API
+- Host-backed guest memory mappings
+- Page-level trap handling for read, write, and execute faults
+- `CPUID` interception
+- Syscall interception for controlled guest experiments
+- Example program that assembles guest code with `asmjit`
 
-This keeps the project small, but still useful for research around lazy memory mapping, instruction exits, and controlled guest execution.
+## Repository Layout
+
+- [`include/vmtrace/vmtrace.hpp`](include/vmtrace/vmtrace.hpp): public library API
+- [`src/lib/vmtrace.cpp`](src/lib/vmtrace.cpp): WHP-backed implementation
+- [`src/examples/demo_main.cpp`](src/examples/demo_main.cpp): demo that runs `cpuid` and a syscall in the guest
 
 ## Prerequisites
 
-On the host, enable these Windows features:
+To run the demo locally, enable these Windows features and reboot:
 
 - `Microsoft-Hyper-V-Hypervisor`
 - `HypervisorPlatform`
 
-On many systems this effectively means enabling Hyper-V and Windows Hypervisor Platform in "Turn Windows features on or off", then rebooting.
+Building the project does not require running Hyper-V guests, but executing the demo does.
 
 ## Build
 
-Use a shell where MSVC is available, such as `x64 Native Tools Command Prompt for VS`:
+Use a shell with MSVC available, for example `x64 Native Tools Command Prompt for VS`:
 
 ```powershell
-cmake -S . -B build -G "Ninja"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
@@ -39,52 +46,38 @@ cmake --build build
 .\build\vmtrace_demo.exe
 ```
 
-The demo accepts one optional flag:
+Expected output looks like:
 
-```powershell
-.\build\vmtrace_demo.exe --stop-on-tail-execute
+```text
+Starting vmtrace demo
+Intercepted CPUID leaf=0x0 subleaf=0x0
+Intercepted syscall number=0x1234 arg0=0x11111111 arg1=0x22222222 arg2=0x33333333 arg3=0x44444444
+Final registers
+  RIP: 0x...
+  RAX: 0xfeedfacecafebeef
+Vendor captured in guest memory: VmTraceLabs!
+Syscall return captured in guest memory: 0xfeedfacecafebeef
 ```
-
-Without the flag, the demo lazily maps a final execute page and halts. With the flag, it stops when that execute trap occurs.
 
 ## Install
 
-`vmtrace` supports `cmake --install` and exports a CMake package:
+The project exports a CMake package:
 
 ```powershell
 cmake --install build --prefix .\build\install
 ```
 
-After installation, consumers can use:
+Then consume it with:
 
 ```cmake
 find_package(vmtrace CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE vmtrace::vmtrace)
 ```
 
-## Expected output
+## CI
 
-You should see output similar to:
+GitHub Actions runs:
 
-```text
-Starting vmtrace demo
-Trap: read gpa=0x2000 gva=0x2000 source=0x2000
-Trap: write gpa=0x3000 gva=0x3000 source=0x3000
-Trap: execute gpa=0x4000 gva=0x4000 source=0x4000
-Final registers
-  RIP: 0x...
-  RAX: 0x...
-  RBX: 0x...
-  RCX: 0x...
-  RDX: 0x...
-  RSP: 0x...
-Host-backed write page value: 0x12345678
-```
-
-## Good next steps
-
-- Add richer register access helpers to the public API
-- Expand `CPUID` interception to configurable leaf lists
-- Add a more explicit syscall interception demo
-- Support larger lazy-mapped regions in trap callbacks
-- Add tests around install/package consumption
+- `clang-format` verification for `src` and `include`
+- CMake configure + Ninja build
+- `cmake --install` to validate the install target
