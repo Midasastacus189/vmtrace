@@ -1,462 +1,160 @@
-#include <Windows.h>
-#include <WinHvPlatform.h>
+#include "whp_lazy_emulator/whp_lazy_emulator.hpp"
 
-#include <array>
-#include <cstdint>
+#include <Windows.h>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 
 namespace
 {
-constexpr UINT32 kVpIndex = 0;
-constexpr WHV_GUEST_PHYSICAL_ADDRESS kGuestCodeGpa = 0x1000;
-constexpr SIZE_T kGuestMemorySize = 0x1000;
+constexpr std::uint64_t code_page_base = 0x1000;
+constexpr std::uint64_t read_page_base = 0x2000;
+constexpr std::uint64_t write_page_base = 0x3000;
+constexpr std::uint64_t tail_code_page_base = 0x4000;
 
-// xor eax, eax; xor ecx, ecx; cpuid; hlt
-constexpr std::array<std::uint8_t, 6> kGuestCode = {0x31, 0xC0, 0x31, 0xC9, 0x0F, 0xA2};
-constexpr std::uint8_t kHltInstruction = 0xF4;
-
-[[noreturn]] void ThrowIfFailed(HRESULT hr, const char* action)
-{
-    if (SUCCEEDED(hr))
-    {
-        throw std::logic_error("ThrowIfFailed called with success code");
-    }
-
-    std::ostringstream stream;
-    stream << action << " failed with HRESULT 0x"
-           << std::hex << std::setw(8) << std::setfill('0') << static_cast<unsigned long>(hr);
-    throw std::runtime_error(stream.str());
-}
-
-void CheckHr(HRESULT hr, const char* action)
-{
-    if (FAILED(hr))
-    {
-        ThrowIfFailed(hr, action);
-    }
-}
-
-WHV_X64_SEGMENT_REGISTER MakeCodeSegment()
-{
-    WHV_X64_SEGMENT_REGISTER segment = {};
-    segment.Base = 0;
-    segment.Limit = 0xFFFFF;
-    segment.Selector = 0x8;
-    segment.SegmentType = 0xB;
-    segment.NonSystemSegment = 1;
-    segment.DescriptorPrivilegeLevel = 0;
-    segment.Present = 1;
-    segment.Long = 0;
-    segment.Default = 1;
-    segment.Granularity = 1;
-    return segment;
-}
-
-WHV_X64_SEGMENT_REGISTER MakeDataSegment()
-{
-    WHV_X64_SEGMENT_REGISTER segment = {};
-    segment.Base = 0;
-    segment.Limit = 0xFFFFF;
-    segment.Selector = 0x10;
-    segment.SegmentType = 0x3;
-    segment.NonSystemSegment = 1;
-    segment.DescriptorPrivilegeLevel = 0;
-    segment.Present = 1;
-    segment.Long = 0;
-    segment.Default = 1;
-    segment.Granularity = 1;
-    return segment;
-}
-
-std::array<UINT32, 3> EncodeVendorString(std::string_view vendor)
-{
-    std::array<char, 12> padded = {};
-    const size_t count = (vendor.size() < padded.size()) ? vendor.size() : padded.size();
-    std::memcpy(padded.data(), vendor.data(), count);
-
-    std::array<UINT32, 3> encoded = {};
-    std::memcpy(&encoded[0], padded.data() + 0, sizeof(UINT32));
-    std::memcpy(&encoded[1], padded.data() + 4, sizeof(UINT32));
-    std::memcpy(&encoded[2], padded.data() + 8, sizeof(UINT32));
-    return encoded;
-}
-
-std::string DecodeVendorString(UINT32 ebx, UINT32 edx, UINT32 ecx)
-{
-    std::array<char, 13> vendor = {};
-    std::memcpy(vendor.data() + 0, &ebx, sizeof(UINT32));
-    std::memcpy(vendor.data() + 4, &edx, sizeof(UINT32));
-    std::memcpy(vendor.data() + 8, &ecx, sizeof(UINT32));
-    vendor[12] = '\0';
-    return std::string(vendor.data());
-}
-
-class VirtualAllocBuffer
+class virtual_alloc_page
 {
 public:
-    explicit VirtualAllocBuffer(SIZE_T size)
-        : size_(size)
-        , ptr_(::VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+    virtual_alloc_page()
+        : page_(static_cast<std::uint8_t*>(::VirtualAlloc(
+              nullptr,
+              whp_lazy_emulator::page_size,
+              MEM_RESERVE | MEM_COMMIT,
+              PAGE_READWRITE)))
     {
-        if (ptr_ == nullptr)
+        if (page_ == nullptr)
         {
             throw std::runtime_error("VirtualAlloc failed");
         }
     }
 
-    ~VirtualAllocBuffer()
+    virtual_alloc_page(const virtual_alloc_page&) = delete;
+    virtual_alloc_page& operator=(const virtual_alloc_page&) = delete;
+
+    ~virtual_alloc_page()
     {
-        if (ptr_ != nullptr)
+        if (page_ != nullptr)
         {
-            ::VirtualFree(ptr_, 0, MEM_RELEASE);
+            ::VirtualFree(page_, 0, MEM_RELEASE);
         }
     }
 
-    VirtualAllocBuffer(const VirtualAllocBuffer&) = delete;
-    VirtualAllocBuffer& operator=(const VirtualAllocBuffer&) = delete;
-
-    void* data() const
+    std::uint8_t* data() const
     {
-        return ptr_;
-    }
-
-    SIZE_T size() const
-    {
-        return size_;
+        return page_;
     }
 
 private:
-    SIZE_T size_;
-    void* ptr_;
+    std::uint8_t* page_ = nullptr;
 };
 
-class PartitionHandle
+struct sample_memory
 {
-public:
-    PartitionHandle()
+    virtual_alloc_page code_page;
+    virtual_alloc_page read_page;
+    virtual_alloc_page write_page;
+    virtual_alloc_page tail_code_page;
+
+    explicit sample_memory(bool stop_on_tail_execute)
+        : stop_on_tail_execute(stop_on_tail_execute)
     {
-        CheckHr(WHvCreatePartition(&handle_), "WHvCreatePartition");
+        std::memset(code_page.data(), 0x90, whp_lazy_emulator::page_size);
+        std::memset(read_page.data(), 0x00, whp_lazy_emulator::page_size);
+        std::memset(write_page.data(), 0x00, whp_lazy_emulator::page_size);
+        std::memset(tail_code_page.data(), 0x90, whp_lazy_emulator::page_size);
+
+        code_page.data()[0] = 0xA1;
+        std::memcpy(code_page.data() + 1, &read_page_target, sizeof(read_page_target));
+
+        code_page.data()[5] = 0xA3;
+        std::memcpy(code_page.data() + 6, &write_page_target, sizeof(write_page_target));
+
+        code_page.data()[10] = 0xE9;
+        const std::int32_t relative_jump = static_cast<std::int32_t>(tail_code_page_base - (code_page_base + 15));
+        std::memcpy(code_page.data() + 11, &relative_jump, sizeof(relative_jump));
+
+        tail_code_page.data()[0] = 0xF4;
+
+        const std::uint32_t value = 0x12345678;
+        std::memcpy(read_page.data(), &value, sizeof(value));
     }
 
-    ~PartitionHandle()
+    whp_lazy_emulator::trap_response on_trap(const whp_lazy_emulator::trap_info& trap) const
     {
-        if (handle_ != nullptr)
+        const std::uint64_t page_base = whp_lazy_emulator::align_down_to_page(trap.guest_physical_address);
+
+        std::cout << "Trap: "
+                  << ((trap.access_kind == whp_lazy_emulator::trap_access_kind::read)
+                          ? "read"
+                          : (trap.access_kind == whp_lazy_emulator::trap_access_kind::write) ? "write" : "execute")
+                  << " gpa=" << whp_lazy_emulator::to_hex(trap.guest_physical_address)
+                  << " gva=" << whp_lazy_emulator::to_hex(trap.guest_virtual_address)
+                  << " source="
+                  << whp_lazy_emulator::to_hex(
+                         trap.guest_virtual_address_valid ? trap.guest_virtual_address : trap.guest_physical_address)
+                  << "\n";
+
+        if (page_base == read_page_base && trap.access_kind == whp_lazy_emulator::trap_access_kind::read)
         {
-            WHvDeletePartition(handle_);
+            whp_lazy_emulator::trap_response response = {};
+            response.resolution = whp_lazy_emulator::trap_resolution::map_page;
+            response.access = whp_lazy_emulator::map_access::read;
+            response.host_page = read_page.data();
+            response.message = "Mapped read-only data page from host memory.";
+            return response;
         }
+
+        if (page_base == write_page_base && trap.access_kind == whp_lazy_emulator::trap_access_kind::write)
+        {
+            whp_lazy_emulator::trap_response response = {};
+            response.resolution = whp_lazy_emulator::trap_resolution::map_page;
+            response.access = whp_lazy_emulator::map_access::read | whp_lazy_emulator::map_access::write;
+            response.host_page = write_page.data();
+            response.message = "Mapped writable data page from host memory.";
+            return response;
+        }
+
+        if (page_base == tail_code_page_base && trap.access_kind == whp_lazy_emulator::trap_access_kind::execute)
+        {
+            if (stop_on_tail_execute)
+            {
+                whp_lazy_emulator::trap_response response = {};
+                response.resolution = whp_lazy_emulator::trap_resolution::stop_emulation;
+                response.message = "Stopped on execute trap for tail code page.";
+                return response;
+            }
+
+            whp_lazy_emulator::trap_response response = {};
+            response.resolution = whp_lazy_emulator::trap_resolution::map_page;
+            response.access = whp_lazy_emulator::map_access::read | whp_lazy_emulator::map_access::execute;
+            response.host_page = tail_code_page.data();
+            response.message = "Mapped tail code page and resumed execution.";
+            return response;
+        }
+
+        whp_lazy_emulator::trap_response response = {};
+        response.resolution = whp_lazy_emulator::trap_resolution::stop_emulation;
+        response.message = "Unhandled page trap at " + whp_lazy_emulator::to_hex(page_base);
+        return response;
     }
 
-    PartitionHandle(const PartitionHandle&) = delete;
-    PartitionHandle& operator=(const PartitionHandle&) = delete;
-
-    WHV_PARTITION_HANDLE get() const
-    {
-        return handle_;
-    }
-
-private:
-    WHV_PARTITION_HANDLE handle_ = nullptr;
+    bool stop_on_tail_execute = false;
+    const std::uint32_t read_page_target = static_cast<std::uint32_t>(read_page_base);
+    const std::uint32_t write_page_target = static_cast<std::uint32_t>(write_page_base);
 };
 
-class VirtualProcessorHandle
+bool has_flag(int argc, char** argv, const std::string& flag)
 {
-public:
-    VirtualProcessorHandle(WHV_PARTITION_HANDLE partition, UINT32 vpIndex)
-        : partition_(partition)
-        , vpIndex_(vpIndex)
+    for (int index = 1; index < argc; ++index)
     {
-        CheckHr(WHvCreateVirtualProcessor(partition_, vpIndex_, 0), "WHvCreateVirtualProcessor");
-    }
-
-    ~VirtualProcessorHandle()
-    {
-        if (partition_ != nullptr)
+        if (argv[index] == flag)
         {
-            WHvDeleteVirtualProcessor(partition_, vpIndex_);
+            return true;
         }
     }
 
-    VirtualProcessorHandle(const VirtualProcessorHandle&) = delete;
-    VirtualProcessorHandle& operator=(const VirtualProcessorHandle&) = delete;
-
-private:
-    WHV_PARTITION_HANDLE partition_ = nullptr;
-    UINT32 vpIndex_ = 0;
-};
-
-void ConfigurePartition(WHV_PARTITION_HANDLE partition)
-{
-    UINT32 processorCount = 1;
-    CheckHr(
-        WHvSetPartitionProperty(
-            partition,
-            WHvPartitionPropertyCodeProcessorCount,
-            &processorCount,
-            sizeof(processorCount)),
-        "WHvSetPartitionProperty(ProcessorCount)");
-
-    WHV_EXTENDED_VM_EXITS exits = {};
-    exits.X64CpuidExit = 1;
-    CheckHr(
-        WHvSetPartitionProperty(
-            partition,
-            WHvPartitionPropertyCodeExtendedVmExits,
-            &exits,
-            sizeof(exits)),
-        "WHvSetPartitionProperty(ExtendedVmExits)");
-
-    const UINT32 cpuidLeaf = 0;
-    CheckHr(
-        WHvSetPartitionProperty(
-            partition,
-            WHvPartitionPropertyCodeCpuidExitList,
-            &cpuidLeaf,
-            sizeof(cpuidLeaf)),
-        "WHvSetPartitionProperty(CpuidExitList)");
-
-    CheckHr(WHvSetupPartition(partition), "WHvSetupPartition");
-}
-
-void InitializeRegisters(WHV_PARTITION_HANDLE partition)
-{
-    const std::array<WHV_REGISTER_NAME, 11> names = {
-        WHvX64RegisterRip,
-        WHvX64RegisterRflags,
-        WHvX64RegisterCs,
-        WHvX64RegisterDs,
-        WHvX64RegisterEs,
-        WHvX64RegisterFs,
-        WHvX64RegisterGs,
-        WHvX64RegisterSs,
-        WHvX64RegisterCr0,
-        WHvX64RegisterCr4,
-        WHvX64RegisterEfer,
-    };
-
-    std::array<WHV_REGISTER_VALUE, names.size()> values = {};
-    values[0].Reg64 = kGuestCodeGpa;
-    values[1].Reg64 = 0x2;
-    values[2].Segment = MakeCodeSegment();
-
-    const WHV_X64_SEGMENT_REGISTER dataSegment = MakeDataSegment();
-    values[3].Segment = dataSegment;
-    values[4].Segment = dataSegment;
-    values[5].Segment = dataSegment;
-    values[6].Segment = dataSegment;
-    values[7].Segment = dataSegment;
-    values[8].Reg64 = 0x1;
-    values[9].Reg64 = 0x0;
-    values[10].Reg64 = 0x0;
-
-    CheckHr(
-        WHvSetVirtualProcessorRegisters(
-            partition,
-            kVpIndex,
-            names.data(),
-            static_cast<UINT32>(names.size()),
-            values.data()),
-        "WHvSetVirtualProcessorRegisters(initial)");
-}
-
-void WriteGuestCode(void* guestMemory)
-{
-    std::memset(guestMemory, 0x90, kGuestMemorySize);
-    std::memcpy(guestMemory, kGuestCode.data(), kGuestCode.size());
-    static_cast<std::uint8_t*>(guestMemory)[kGuestCode.size()] = kHltInstruction;
-}
-
-void EnsurePlatformSupportsCpuidExits()
-{
-    BOOL hypervisorPresent = FALSE;
-    UINT32 bytesWritten = 0;
-    CheckHr(
-        WHvGetCapability(
-            WHvCapabilityCodeHypervisorPresent,
-            &hypervisorPresent,
-            sizeof(hypervisorPresent),
-            &bytesWritten),
-        "WHvGetCapability(HypervisorPresent)");
-
-    if (!hypervisorPresent)
-    {
-        throw std::runtime_error("The Windows hypervisor is not present. Enable Hyper-V and Windows Hypervisor Platform.");
-    }
-
-    WHV_EXTENDED_VM_EXITS exits = {};
-    CheckHr(
-        WHvGetCapability(
-            WHvCapabilityCodeExtendedVmExits,
-            &exits,
-            sizeof(exits),
-            &bytesWritten),
-        "WHvGetCapability(ExtendedVmExits)");
-
-    if (!exits.X64CpuidExit)
-    {
-        throw std::runtime_error("This host does not report WHP CPUID-exit support.");
-    }
-}
-
-void AdvanceRipAfterExit(WHV_PARTITION_HANDLE partition, const WHV_RUN_VP_EXIT_CONTEXT& exitContext)
-{
-    const WHV_REGISTER_NAME name = WHvX64RegisterRip;
-    WHV_REGISTER_VALUE value = {};
-    value.Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
-
-    CheckHr(
-        WHvSetVirtualProcessorRegisters(partition, kVpIndex, &name, 1, &value),
-        "WHvSetVirtualProcessorRegisters(RIP)");
-}
-
-void SetCpuidResult(
-    WHV_PARTITION_HANDLE partition,
-    UINT32 eax,
-    UINT32 ebx,
-    UINT32 ecx,
-    UINT32 edx)
-{
-    const std::array<WHV_REGISTER_NAME, 4> names = {
-        WHvX64RegisterRax,
-        WHvX64RegisterRbx,
-        WHvX64RegisterRcx,
-        WHvX64RegisterRdx,
-    };
-
-    std::array<WHV_REGISTER_VALUE, names.size()> values = {};
-    values[0].Reg64 = eax;
-    values[1].Reg64 = ebx;
-    values[2].Reg64 = ecx;
-    values[3].Reg64 = edx;
-
-    CheckHr(
-        WHvSetVirtualProcessorRegisters(
-            partition,
-            kVpIndex,
-            names.data(),
-            static_cast<UINT32>(names.size()),
-            values.data()),
-        "WHvSetVirtualProcessorRegisters(CPUID result)");
-}
-
-void PrintFinalRegisters(WHV_PARTITION_HANDLE partition)
-{
-    const std::array<WHV_REGISTER_NAME, 4> names = {
-        WHvX64RegisterRax,
-        WHvX64RegisterRbx,
-        WHvX64RegisterRcx,
-        WHvX64RegisterRdx,
-    };
-
-    std::array<WHV_REGISTER_VALUE, names.size()> values = {};
-    CheckHr(
-        WHvGetVirtualProcessorRegisters(
-            partition,
-            kVpIndex,
-            names.data(),
-            static_cast<UINT32>(names.size()),
-            values.data()),
-        "WHvGetVirtualProcessorRegisters(final)");
-
-    const UINT32 eax = static_cast<UINT32>(values[0].Reg64);
-    const UINT32 ebx = static_cast<UINT32>(values[1].Reg64);
-    const UINT32 ecx = static_cast<UINT32>(values[2].Reg64);
-    const UINT32 edx = static_cast<UINT32>(values[3].Reg64);
-
-    std::cout << "Final guest-visible CPUID leaf 0 values\n";
-    std::cout << "  EAX: 0x" << std::hex << eax << "\n";
-    std::cout << "  EBX: 0x" << std::hex << ebx << "\n";
-    std::cout << "  ECX: 0x" << std::hex << ecx << "\n";
-    std::cout << "  EDX: 0x" << std::hex << edx << "\n";
-    std::cout << "  Vendor: " << DecodeVendorString(ebx, edx, ecx) << "\n";
-}
-
-void RunDemo(std::string_view spoofedVendor)
-{
-    EnsurePlatformSupportsCpuidExits();
-
-    PartitionHandle partition;
-    ConfigurePartition(partition.get());
-
-    VirtualAllocBuffer guestMemory(kGuestMemorySize);
-    WriteGuestCode(guestMemory.data());
-
-    CheckHr(
-        WHvMapGpaRange(
-            partition.get(),
-            guestMemory.data(),
-            kGuestCodeGpa,
-            guestMemory.size(),
-            WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute),
-        "WHvMapGpaRange");
-
-    VirtualProcessorHandle virtualProcessor(partition.get(), kVpIndex);
-    InitializeRegisters(partition.get());
-
-    const std::array<UINT32, 3> vendor = EncodeVendorString(spoofedVendor);
-    bool halted = false;
-    bool cpuidIntercepted = false;
-
-    while (!halted)
-    {
-        WHV_RUN_VP_EXIT_CONTEXT exitContext = {};
-        CheckHr(
-            WHvRunVirtualProcessor(
-                partition.get(),
-                kVpIndex,
-                &exitContext,
-                sizeof(exitContext)),
-            "WHvRunVirtualProcessor");
-
-        switch (exitContext.ExitReason)
-        {
-        case WHvRunVpExitReasonX64Cpuid:
-        {
-            cpuidIntercepted = true;
-            const auto& cpuid = exitContext.CpuidAccess;
-
-            std::cout << "Intercepted CPUID leaf 0x" << std::hex << cpuid.Rax
-                      << ", subleaf 0x" << cpuid.Rcx << "\n";
-            std::cout << "  Default vendor: "
-                      << DecodeVendorString(
-                             static_cast<UINT32>(cpuid.DefaultResultRbx),
-                             static_cast<UINT32>(cpuid.DefaultResultRdx),
-                             static_cast<UINT32>(cpuid.DefaultResultRcx))
-                      << "\n";
-
-            SetCpuidResult(
-                partition.get(),
-                static_cast<UINT32>(cpuid.DefaultResultRax),
-                vendor[0],
-                vendor[2],
-                vendor[1]);
-
-            AdvanceRipAfterExit(partition.get(), exitContext);
-            break;
-        }
-        case WHvRunVpExitReasonX64Halt:
-            halted = true;
-            break;
-        default:
-        {
-            std::ostringstream stream;
-            stream << "Unexpected VP exit reason: 0x" << std::hex << exitContext.ExitReason;
-            throw std::runtime_error(stream.str());
-        }
-        }
-    }
-
-    if (!cpuidIntercepted)
-    {
-        throw std::runtime_error("Guest halted without triggering a CPUID exit.");
-    }
-
-    PrintFinalRegisters(partition.get());
+    return false;
 }
 } // namespace
 
@@ -464,17 +162,52 @@ int main(int argc, char** argv)
 {
     try
     {
-        const std::string spoofedVendor = (argc > 1) ? argv[1] : "OpenAI  Lab";
+        const bool stop_on_tail_execute = has_flag(argc, argv, "--stop-on-tail-execute");
 
-        std::cout << "Starting WHP CPUID interception demo\n";
-        std::cout << "Requested vendor string: " << spoofedVendor << "\n";
+        std::cout << "Starting lazy WHP emulator demo\n";
+        if (stop_on_tail_execute)
+        {
+            std::cout << "Tail execute trap will stop emulation instead of mapping the page.\n";
+        }
 
-        RunDemo(spoofedVendor);
+        sample_memory sample(stop_on_tail_execute);
+        whp_lazy_emulator::emulator emulator(
+            [&sample](const whp_lazy_emulator::trap_info& trap)
+            {
+                return sample.on_trap(trap);
+            });
+
+        emulator.map_memory({
+            sample.code_page.data(),
+            whp_lazy_emulator::page_size,
+            whp_lazy_emulator::map_access::read | whp_lazy_emulator::map_access::execute,
+            code_page_base,
+        });
+
+        whp_lazy_emulator::cpu_state initial_state = {};
+        initial_state.rip = code_page_base;
+        initial_state.rsp = 0x9000;
+
+        emulator.set_cpu_state(initial_state);
+        emulator.run();
+
+        const auto registers = emulator.read_registers();
+        const auto write_value = *reinterpret_cast<const std::uint32_t*>(sample.write_page.data());
+
+        std::cout << "Final registers\n";
+        std::cout << "  RIP: " << whp_lazy_emulator::to_hex(registers.rip) << "\n";
+        std::cout << "  RAX: " << whp_lazy_emulator::to_hex(registers.rax) << "\n";
+        std::cout << "  RBX: " << whp_lazy_emulator::to_hex(registers.rbx) << "\n";
+        std::cout << "  RCX: " << whp_lazy_emulator::to_hex(registers.rcx) << "\n";
+        std::cout << "  RDX: " << whp_lazy_emulator::to_hex(registers.rdx) << "\n";
+        std::cout << "  RSP: " << whp_lazy_emulator::to_hex(registers.rsp) << "\n";
+        std::cout << "Host-backed write page value: " << whp_lazy_emulator::to_hex(write_value) << "\n";
+
         return 0;
     }
-    catch (const std::exception& ex)
+    catch (const std::exception& exception)
     {
-        std::cerr << "Error: " << ex.what() << "\n";
+        std::cerr << "Error: " << exception.what() << "\n";
         return 1;
     }
 }
