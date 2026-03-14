@@ -6,11 +6,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(FetchContent)
 
 set(ASMJIT_EMBED ON CACHE BOOL "" FORCE)
 set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
 set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
-add_subdirectory(third_party/asmjit)
+
+FetchContent_Declare(
+    asmjit
+    GIT_REPOSITORY https://github.com/asmjit/asmjit.git
+    GIT_TAG 64a88ed1d8abb2e2b17a938a5ce7c1b66dabb695
+    GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(asmjit)
 
 add_library(vmtrace STATIC
     src/lib/vmtrace.cpp
