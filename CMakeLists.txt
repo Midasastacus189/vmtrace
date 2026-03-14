@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(whp_lazy_emulator LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 add_library(whp_lazy_emulator_lib STATIC
     src/whp_lazy_emulator.cpp
 )
